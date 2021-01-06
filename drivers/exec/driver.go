@@ -78,10 +78,12 @@ var (
 	// taskConfigSpec is the hcl specification for the driver config section of
 	// a task within a job. It is returned in the TaskConfigSchema RPC
 	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
-		"command":  hclspec.NewAttr("command", "string", true),
-		"args":     hclspec.NewAttr("args", "list(string)", false),
-		"pid_mode": hclspec.NewAttr("pid_mode", "string", false),
-		"ipc_mode": hclspec.NewAttr("ipc_mode", "string", false),
+		"command":    hclspec.NewAttr("command", "string", true),
+		"args":       hclspec.NewAttr("args", "list(string)", false),
+		"pid_mode":   hclspec.NewAttr("pid_mode", "string", false),
+		"ipc_mode":   hclspec.NewAttr("ipc_mode", "string", false),
+		"flake":      hclspec.NewAttr("flake", "string", false),
+		"flake_args": hclspec.NewAttr("flake_args", "list(string)", false),
 	})
 
 	// capabilities is returned by the Capabilities RPC and indicates what
@@ -172,7 +174,8 @@ type TaskConfig struct {
 
 	// ModeIPC indicates whether IPC namespace isolation is enabled for the task.
 	// Must be "private" or "host" if set.
-	ModeIPC string `codec:"ipc_mode"`
+	ModeIPC string  `codec:"ipc_mode"`
+	Flake   *string `codec:"flake"`
 }
 
 func (tc *TaskConfig) validate() error {
