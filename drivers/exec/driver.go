@@ -72,6 +72,7 @@ var (
 	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
 		"command": hclspec.NewAttr("command", "string", true),
 		"args":    hclspec.NewAttr("args", "list(string)", false),
+		"flake":   hclspec.NewAttr("flake", "string", false),
 	})
 
 	// capabilities is returned by the Capabilities RPC and indicates what
@@ -128,6 +129,7 @@ type Config struct {
 type TaskConfig struct {
 	Command string   `codec:"command"`
 	Args    []string `codec:"args"`
+	Flake   *string  `codec:"flake"`
 }
 
 // TaskState is the state which is encoded in the handle returned in
