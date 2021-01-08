@@ -50,25 +50,37 @@ func (h *nixHook) install(flake string, taskDir string) error {
 
 	// First we build the derivation to make sure all paths are in the host store
 	cmd := exec.Command("nix", "build", "--no-link", flake)
-	nixBuildOutput, err := cmd.Output()
-	h.logger.Debug("nix build --no-link", "flake", flake, "output", string(nixBuildOutput))
+	cmd.Stderr = os.Stderr
+	nixBuildOutput, err := cmd.CombinedOutput()
+	h.logger.Debug(cmd.String(), "output", string(nixBuildOutput))
 	if err != nil {
+		h.logger.Error(cmd.String(), "output", string(nixBuildOutput), "error", err)
 		return err
 	}
 
 	// Then get the path to the derivation output
 	cmd = exec.Command("nix", "eval", "--raw", flake+".outPath")
 	nixEvalOutput, err := cmd.Output()
-	h.logger.Debug("nix eval --raw", "expr", flake+".outPath", "output", string(nixEvalOutput))
+	h.logger.Debug(cmd.String(), "stdout", string(nixEvalOutput))
 	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			h.logger.Error(cmd.String(), "error", err, "stderr", string(ee.Stderr))
+		} else {
+			h.logger.Error(cmd.String(), "error", err, "stdout", string(nixEvalOutput))
+		}
 		return err
 	}
 
 	// Collect all store paths required to run it
 	cmd = exec.Command("nix-store", "--query", "--requisites", string(nixEvalOutput))
 	nixStoreOutput, err := cmd.Output()
-	h.logger.Debug("nix-store --query --requisites", "path", string(nixEvalOutput), "output", string(nixStoreOutput))
+	h.logger.Debug(cmd.String(), "output", string(nixStoreOutput))
 	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			h.logger.Error(cmd.String(), "error", err, "stderr", string(ee.Stderr))
+		} else {
+			h.logger.Error(cmd.String(), "error", err, "stdout", string(nixStoreOutput))
+		}
 		return err
 	}
 
@@ -81,8 +93,6 @@ func (h *nixHook) install(flake string, taskDir string) error {
 			return err
 		}
 	}
-
-	h.logger.Debug("Creating top-level links...")
 
 	// TODO: choose correct architecture, atm this only works on x86_64-linux
 	// This uses the nixpkgs symlinkJoin derivation to build a directory that
@@ -101,7 +111,13 @@ func (h *nixHook) install(flake string, taskDir string) error {
 			in builtins.seq (builtins.pathExists sym) sym.outPath
 	`)
 	symlinkOutput, err := cmd.Output()
+	h.logger.Debug(cmd.String(), string(symlinkOutput))
 	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			h.logger.Error(cmd.String(), "error", err, "stderr", string(ee.Stderr))
+		} else {
+			h.logger.Error(cmd.String(), "error", err, "stdout", string(symlinkOutput))
+		}
 		return err
 	}
 
