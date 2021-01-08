@@ -2,6 +2,7 @@ package taskrunner
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -15,6 +16,12 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
+const (
+	// HookNameNix is the name of the Nix hook
+	HookNameNix = "nix"
+)
+
+// nixHook is used to prepare a task directory structure based on a Nix flake
 type nixHook struct {
 	alloc   *structs.Allocation
 	runner  *TaskRunner
@@ -32,12 +39,17 @@ func newNixHook(runner *TaskRunner, logger log.Logger) *nixHook {
 }
 
 func (*nixHook) Name() string {
-	return "nix"
+	return HookNameNix
 }
 
 func (h *nixHook) Prestart(ctx context.Context, req *interfaces.TaskPrestartRequest, resp *interfaces.TaskPrestartResponse) error {
 	h.taskEnv = req.TaskEnv
-	flake, ok := req.Task.Config["flake"].(string)
+	flakeConfig, ok := req.Task.Config["flake"]
+	if !ok {
+		return nil
+	}
+
+	flake, ok := flakeConfig.(string)
 	if !ok {
 		return nil
 	}
@@ -45,34 +57,94 @@ func (h *nixHook) Prestart(ctx context.Context, req *interfaces.TaskPrestartRequ
 	return h.install(flake, req.TaskDir.Dir)
 }
 
+// install takes a flake URL like:
+// github:NixOS/nixpkgs#cowsay
+// github:NixOS/nixpkgs?ref=nixpkgs-unstable#cowsay
+// github:NixOS/nixpkgs?rev=04b19784342ac2d32f401b52c38a43a1352cd916#cowsay
+//
+// the given flake
 func (h *nixHook) install(flake string, taskDir string) error {
 	h.logger.Debug("Building flake", "flake", flake)
 
+	system, err := h.nixSystem()
+	if err != nil {
+		return err
+	}
+
+	if err := h.nixBuild(flake); err != nil {
+		return err
+	}
+	outPath, err := h.outPath(flake)
+	if err != nil {
+		return err
+	}
+	requisites, err := h.requisites(outPath)
+	if err != nil {
+		return err
+	}
+
+	// Now copy each dependency into the allocation directory
+	for _, requisit := range requisites {
+		err = filepath.Walk(requisit, copyAll(h.logger, taskDir, false))
+		if err != nil {
+			return err
+		}
+	}
+
+	symlinkJoin, err := h.symlinkJoin(flake, system)
+	if err != nil {
+		return err
+	}
+
+	return filepath.Walk(symlinkJoin, copyAll(h.logger, taskDir, true))
+}
+
+func (h *nixHook) nixSystem() (string, error) {
+	// First we build the derivation to make sure all paths are in the host store
+	cmd := exec.Command("nix", "eval", "--raw", "--impure", "--expr", "builtins.currentSystem")
+	output, err := cmd.CombinedOutput()
+	currentSystem := string(output)
+	h.logger.Debug(cmd.String(), "output", currentSystem)
+	if err != nil {
+		h.logger.Error(cmd.String(), "output", currentSystem, "error", err)
+		return "", err
+	}
+	return currentSystem, nil
+}
+
+func (h *nixHook) nixBuild(flake string) error {
 	// First we build the derivation to make sure all paths are in the host store
 	cmd := exec.Command("nix", "build", "--no-link", flake)
-	cmd.Stderr = os.Stderr
 	nixBuildOutput, err := cmd.CombinedOutput()
 	h.logger.Debug(cmd.String(), "output", string(nixBuildOutput))
 	if err != nil {
 		h.logger.Error(cmd.String(), "output", string(nixBuildOutput), "error", err)
 		return err
 	}
+	return nil
+}
 
+func (h *nixHook) outPath(flake string) (string, error) {
 	// Then get the path to the derivation output
-	cmd = exec.Command("nix", "eval", "--raw", flake+".outPath")
+	cmd := exec.Command("nix", "eval", "--raw", flake+".outPath")
 	nixEvalOutput, err := cmd.Output()
-	h.logger.Debug(cmd.String(), "stdout", string(nixEvalOutput))
+	path := string(nixEvalOutput)
+	h.logger.Debug(cmd.String(), "stdout", path)
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			h.logger.Error(cmd.String(), "error", err, "stderr", string(ee.Stderr))
 		} else {
-			h.logger.Error(cmd.String(), "error", err, "stdout", string(nixEvalOutput))
+			h.logger.Error(cmd.String(), "error", err, "stdout", path)
 		}
-		return err
+		return path, err
 	}
 
+	return path, nil
+}
+
+func (h *nixHook) requisites(outPath string) ([]string, error) {
 	// Collect all store paths required to run it
-	cmd = exec.Command("nix-store", "--query", "--requisites", string(nixEvalOutput))
+	cmd := exec.Command("nix-store", "--query", "--requisites", outPath)
 	nixStoreOutput, err := cmd.Output()
 	h.logger.Debug(cmd.String(), "output", string(nixStoreOutput))
 	if err != nil {
@@ -81,53 +153,46 @@ func (h *nixHook) install(flake string, taskDir string) error {
 		} else {
 			h.logger.Error(cmd.String(), "error", err, "stdout", string(nixStoreOutput))
 		}
-		return err
+		return []string{}, err
 	}
 
-	// Now copy each dependency into the allocation directory
-	storePaths := strings.Fields(string(nixStoreOutput))
-	for _, storePath := range storePaths {
-		h.logger.Debug("copying", "path", storePath)
-		err = filepath.Walk(storePath, copyAll(h.logger, taskDir, false))
-		if err != nil {
-			return err
-		}
-	}
+	return strings.Fields(string(nixStoreOutput)), nil
+}
 
-	// TODO: choose correct architecture, atm this only works on x86_64-linux
-	// This uses the nixpkgs symlinkJoin derivation to build a directory that
-	// looks like normal FHS, e.g. /bin /share /etc and the like.
-	cmd = exec.Command(
+// TODO: choose correct architecture, atm this only works on x86_64-linux
+// This uses the nixpkgs symlinkJoin derivation to build a directory that
+// looks like normal FHS, e.g. /bin /share /etc and the like.
+func (h *nixHook) symlinkJoin(flake string, system string) (string, error) {
+	cmd := exec.Command(
 		"nix", "eval", "--raw", flake, "--apply", `
 			let
 				pkgs = builtins.getFlake
 					"github:NixOS/nixpkgs?rev=aea7242187f21a120fe73b5099c4167e12ec9aab";
 			in pkg:
 			let
-				sym = pkgs.legacyPackages.x86_64-linux.symlinkJoin {
+				sym = pkgs.legacyPackages.`+system+`.symlinkJoin {
 					name = "symlinks";
 					paths = [ pkg ];
 				};
 			in builtins.seq (builtins.pathExists sym) sym.outPath
 	`)
 	symlinkOutput, err := cmd.Output()
-	h.logger.Debug(cmd.String(), string(symlinkOutput))
+	output := string(symlinkOutput)
+	h.logger.Debug(cmd.String(), "output", output)
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			h.logger.Error(cmd.String(), "error", err, "stderr", string(ee.Stderr))
 		} else {
 			h.logger.Error(cmd.String(), "error", err, "stdout", string(symlinkOutput))
 		}
-		return err
+		return "", err
 	}
 
-	return filepath.Walk(string(symlinkOutput), copyAll(h.logger, taskDir, true))
+	return output, nil
 }
 
 func copyAll(logger hclog.Logger, targetDir string, truncate bool) filepath.WalkFunc {
 	return func(path string, info os.FileInfo, err error) error {
-		logger.Debug("walking", "path", path)
-
 		if err != nil {
 			return err
 		}
@@ -140,15 +205,16 @@ func copyAll(logger hclog.Logger, targetDir string, truncate bool) filepath.Walk
 			dst = filepath.Join(targetDir, path)
 		}
 
-		logger.Debug("calculated dst", "dst", dst)
-
 		// Skip the file if it already exists at the dst
-		stat, err := os.Lstat(dst)
-		logger.Debug("stat errors?", "err", err, "stat", stat)
+		stat, err := os.Stat(dst)
+		lstat, _ := os.Lstat(dst)
 		if err == nil {
 			return nil
 		}
 		if !os.IsNotExist(err) {
+			logger.Debug("stat errors", "err", err, "stat",
+				fmt.Sprintf("%#v", stat),
+			)
 			return err
 		}
 
@@ -159,6 +225,8 @@ func copyAll(logger hclog.Logger, targetDir string, truncate bool) filepath.Walk
 			}
 			logger.Debug("l", "link", link, "dst", dst)
 			if err := os.Symlink(link, dst); err != nil {
+				logger.Debug("stat", fmt.Sprintf("%#v", stat))
+				logger.Debug("lstat", fmt.Sprintf("%#v", lstat))
 				return err
 			}
 			if info.IsDir() {
