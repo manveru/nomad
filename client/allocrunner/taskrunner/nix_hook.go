@@ -12,7 +12,6 @@ import (
 	hclog "github.com/hashicorp/go-hclog"
 	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/client/allocrunner/interfaces"
-	"github.com/hashicorp/nomad/client/taskenv"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -23,10 +22,9 @@ const (
 
 // nixHook is used to prepare a task directory structure based on a Nix flake
 type nixHook struct {
-	alloc   *structs.Allocation
-	runner  *TaskRunner
-	logger  log.Logger
-	taskEnv *taskenv.TaskEnv
+	alloc  *structs.Allocation
+	runner *TaskRunner
+	logger log.Logger
 }
 
 func newNixHook(runner *TaskRunner, logger log.Logger) *nixHook {
@@ -42,8 +40,15 @@ func (*nixHook) Name() string {
 	return HookNameNix
 }
 
+func (h *nixHook) emitEvent(event string, message string) {
+	h.runner.EmitEvent(structs.NewTaskEvent(event).SetDisplayMessage(message))
+}
+
+func (h *nixHook) emitEventError(event string, err error) {
+	h.runner.EmitEvent(structs.NewTaskEvent(event).SetFailsTask().SetSetupError(err))
+}
+
 func (h *nixHook) Prestart(ctx context.Context, req *interfaces.TaskPrestartRequest, resp *interfaces.TaskPrestartResponse) error {
-	h.taskEnv = req.TaskEnv
 	flakeConfig, ok := req.Task.Config["flake"]
 	if !ok {
 		return nil
@@ -65,6 +70,7 @@ func (h *nixHook) Prestart(ctx context.Context, req *interfaces.TaskPrestartRequ
 // the given flake
 func (h *nixHook) install(flake string, taskDir string) error {
 	h.logger.Debug("Building flake", "flake", flake)
+	h.emitEvent("Nix", "building flake: "+flake)
 
 	system, err := h.nixSystem()
 	if err != nil {
@@ -112,14 +118,19 @@ func (h *nixHook) nixSystem() (string, error) {
 	return currentSystem, nil
 }
 
+// nixBuild ensures all requisites are present in the host Nix store.
 func (h *nixHook) nixBuild(flake string) error {
-	// First we build the derivation to make sure all paths are in the host store
 	cmd := exec.Command("nix", "build", "--no-link", flake)
-	nixBuildOutput, err := cmd.CombinedOutput()
+	nixBuildOutput, err := cmd.Output()
 	h.logger.Debug(cmd.String(), "output", string(nixBuildOutput))
 	if err != nil {
-		h.logger.Error(cmd.String(), "output", string(nixBuildOutput), "error", err)
-		return err
+		if ee, ok := err.(*exec.ExitError); ok {
+			h.logger.Error(cmd.String(), "error", err, "stderr", string(ee.Stderr))
+			return NewHookError(err, structs.NewTaskEvent("Nix build failed").SetDisplayMessage(string(ee.Stderr)))
+		} else {
+			h.logger.Error(cmd.String(), "error", err, "stdout", string(nixBuildOutput))
+			return NewHookError(err, structs.NewTaskEvent("Nix build failed").SetDisplayMessage(string(ee.Stderr)))
+		}
 	}
 	return nil
 }
