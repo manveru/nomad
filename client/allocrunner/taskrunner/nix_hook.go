@@ -263,13 +263,13 @@ func copyAll(logger hclog.Logger, targetDir string, truncate bool, uid, gid int)
 		}
 
 		logger.Debug("f", "dst", dst)
-		srcfd, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, info.Mode())
+		srcfd, err := os.Open(path)
 		if err != nil {
 			return err
 		}
 		defer srcfd.Close()
 
-		dstfd, err := os.Create(dst)
+		dstfd, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE, info.Mode())
 		if err != nil {
 			return err
 		}
