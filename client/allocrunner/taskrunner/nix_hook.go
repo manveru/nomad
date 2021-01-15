@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	hclog "github.com/hashicorp/go-hclog"
 	log "github.com/hashicorp/go-hclog"
@@ -89,9 +90,16 @@ func (h *nixHook) install(flake string, taskDir string) error {
 		return err
 	}
 
+	taskDirInfo, err := os.Stat(taskDir)
+	if err != nil {
+		return err
+	}
+
+	uid, gid := getOwner(taskDirInfo)
+
 	// Now copy each dependency into the allocation directory
 	for _, requisit := range requisites {
-		err = filepath.Walk(requisit, copyAll(h.logger, taskDir, false))
+		err = filepath.Walk(requisit, copyAll(h.logger, taskDir, false, uid, gid))
 		if err != nil {
 			return err
 		}
@@ -102,7 +110,7 @@ func (h *nixHook) install(flake string, taskDir string) error {
 		return err
 	}
 
-	return filepath.Walk(symlinkJoin, copyAll(h.logger, taskDir, true))
+	return filepath.Walk(symlinkJoin, copyAll(h.logger, taskDir, true, uid, gid))
 }
 
 func (h *nixHook) nixSystem() (string, error) {
@@ -202,7 +210,7 @@ func (h *nixHook) symlinkJoin(flake string, system string) (string, error) {
 	return output, nil
 }
 
-func copyAll(logger hclog.Logger, targetDir string, truncate bool) filepath.WalkFunc {
+func copyAll(logger hclog.Logger, targetDir string, truncate bool, uid, gid int) filepath.WalkFunc {
 	return func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -236,9 +244,11 @@ func copyAll(logger hclog.Logger, targetDir string, truncate bool) filepath.Walk
 			}
 			logger.Debug("l", "link", link, "dst", dst)
 			if err := os.Symlink(link, dst); err != nil {
-				logger.Debug("stat", fmt.Sprintf("%#v", stat))
-				logger.Debug("lstat", fmt.Sprintf("%#v", lstat))
-				return err
+				if !os.IsExist(err) {
+					logger.Debug("stat", fmt.Sprintf("%#v", stat))
+					logger.Debug("lstat", fmt.Sprintf("%#v", lstat))
+					return err
+				}
 			}
 			if info.IsDir() {
 				return filepath.SkipDir
@@ -253,7 +263,7 @@ func copyAll(logger hclog.Logger, targetDir string, truncate bool) filepath.Walk
 		}
 
 		logger.Debug("f", "dst", dst)
-		srcfd, err := os.Open(path)
+		srcfd, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, info.Mode())
 		if err != nil {
 			return err
 		}
@@ -269,8 +279,20 @@ func copyAll(logger hclog.Logger, targetDir string, truncate bool) filepath.Walk
 			return err
 		}
 
-		return os.Chmod(dst, info.Mode())
+		if err := dstfd.Chown(uid, gid); err != nil {
+			return fmt.Errorf("Couldn't copy %q to %q: %v", path, dst, err)
+		}
+
+		return nil
 	}
+}
+
+func getOwner(fi os.FileInfo) (int, int) {
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return -1, -1
+	}
+	return int(stat.Uid), int(stat.Gid)
 }
 
 // SplitPath splits a file path into its directories and filename.
