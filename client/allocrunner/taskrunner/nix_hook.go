@@ -242,7 +242,7 @@ func copyAll(logger hclog.Logger, targetDir string, truncate bool, uid, gid int)
 			if err != nil {
 				return err
 			}
-			logger.Debug("l", "link", link, "dst", dst)
+			// logger.Debug("l", "link", link, "dst", dst)
 			if err := os.Symlink(link, dst); err != nil {
 				if !os.IsExist(err) {
 					logger.Debug("stat", fmt.Sprintf("%#v", stat))
@@ -258,11 +258,11 @@ func copyAll(logger hclog.Logger, targetDir string, truncate bool, uid, gid int)
 		}
 
 		if info.IsDir() {
-			logger.Debug("d", "dst", dst)
+			// logger.Debug("d", "dst", dst)
 			return os.MkdirAll(dst, 0777)
 		}
 
-		logger.Debug("f", "dst", dst)
+		// logger.Debug("f", "dst", dst)
 		srcfd, err := os.Open(path)
 		if err != nil {
 			return err
